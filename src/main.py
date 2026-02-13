@@ -17,6 +17,7 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 GAMMA_MARKETS = f"{GAMMA_BASE}/markets"
 GAMMA_EVENT_BY_SLUG = f"{GAMMA_BASE}/events/slug"   # /{slug}
 CLOB_MARKET_WSS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -186,6 +187,10 @@ async def ws_subscribe_and_print(asset_ids, slug: str, question: str, out_dir: s
                             proc_ms = ns_to_ms(proc_end_ns - recv_ns)
 
                             # ✅ Write to CSV (you can choose to log only book events if you want)
+                            # ensure we log only this single message, not the whole batch
+                            one = json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
+
+
                             row = {
                                 "utc_iso": utc_now_iso(),
                                 "slug": slug,
@@ -201,8 +206,9 @@ async def ws_subscribe_and_print(asset_ids, slug: str, question: str, out_dir: s
                                 "proc_latency_ms": proc_ms,
                                 "net_latency_ms": net_ms,
                                 "e2e_latency_ms": e2e_ms,
-                                "raw_json": raw if len(raw) < 20000 else raw[:20000],
+                                "raw_json": one if len(one) < 20000 else one[:20000],
                             }
+
                             if event_type == "book":
                                 writer.write(row)
 
@@ -291,6 +297,28 @@ def normalize_token_ids(token_ids):
     return []
 
 
+def auto_pick_slug(query: str = "tennis", page: int = 1, limit_per_type: int = 50) -> str:
+    qs = urlencode({
+        "q": query,
+        "limit_per_type": str(limit_per_type),
+        "page": str(page),
+        "events_status": "active",
+        "search_profiles": "false",
+        "search_tags": "false",
+    })
+    url = f"{SEARCH_URL}?{qs}"
+    data = http_get_json(url)
+
+    events = data.get("events") or []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("enableOrderBook") is True:
+            slug = ev.get("slug")
+            if isinstance(slug, str) and slug.strip():
+                return slug.strip()
+
+    raise RuntimeError("No CLOB-enabled events found via public-search. Try a different --query or --page.")
 
 
 
@@ -339,23 +367,36 @@ class CsvWriter:
 
 
 
-
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--slug", required=True, help="Slug from search results, e.g. wta-uchijim-bondar-2026-02-13")
-    p.add_argument("--print-every", type=int, default=1)
+
+    # Selection
+    p.add_argument("--slug", help="Market/event slug (if not using --auto)")
+    p.add_argument("--auto", action="store_true", help="Auto-pick an active tennis event from public-search")
+    p.add_argument("--query", default="tennis", help="Search query for --auto (default: tennis)")
+    p.add_argument("--page", type=int, default=1, help="Search page for --auto (default: 1)")
+
+    # Output / logging
     p.add_argument("--out", default="data", help="Output directory (default: data)")
-    p.add_argument("--debug-keys", action="store_true", help="Print keys if token ids missing")
+    p.add_argument("--print-every", type=int, default=1, help="Print every N book updates (default: 1)")
+    p.add_argument("--debug-keys", action="store_true", help="Print payload keys if token ids missing")
+
     args = p.parse_args()
 
-    slug = args.slug
-    print(f"[{utc_now_iso()}] Trying /markets?slug=... for slug={slug}", flush=True)
+    # Pick slug
+    if args.auto:
+        slug = auto_pick_slug(query=args.query, page=args.page)
+        print(f"[{utc_now_iso()}] Auto-picked slug: {slug}", flush=True)
+    else:
+        if not args.slug:
+            raise SystemExit("You must provide --slug OR use --auto")
+        slug = args.slug
 
     token_ids = None
     outcomes = None
-    question = ""  # ✅ will be filled from whichever path succeeds
+    question = ""
 
-    # 1) Try market by slug
+
     try:
         market = fetch_market_by_slug(slug)
         question = str(market.get("question") or "")
@@ -393,8 +434,6 @@ def main():
                 print("DEBUG market keys:", list(m.keys()), flush=True)
                 print("DEBUG clobTokenIds type:", type(m.get("clobTokenIds")), flush=True)
                 print("DEBUG clobTokenIds value repr:", repr(m.get("clobTokenIds"))[:300], flush=True)
-                print("DEBUG outcomes type:", type(m.get("outcomes")), flush=True)
-                print("DEBUG outcomes repr:", repr(m.get("outcomes"))[:300], flush=True)
 
     if not token_ids:
         raise RuntimeError(
@@ -411,7 +450,6 @@ def main():
         for tid in token_ids:
             print(f"  - {tid}", flush=True)
 
-    # ✅ IMPORTANT: call with new signature
     asyncio.run(
         ws_subscribe_and_print(
             token_ids,
