@@ -296,6 +296,22 @@ def normalize_token_ids(token_ids):
 
     return []
 
+def is_match_event(ev: dict) -> bool:
+    title = str(ev.get("title") or "").lower()
+    slug = str(ev.get("slug") or "").lower()
+
+    # Match titles usually contain "vs"
+    if " vs " in title:
+        return True
+
+    # Match slugs often look like playera-playerb-date
+    # Exclude obvious outrights/futures
+    bad_words = ["to-win", "winner", "champion", "outright", "futures", "grand-slam"]
+    if any(word in slug for word in bad_words):
+        return False
+
+    return False
+
 
 def auto_pick_slug(query: str = "tennis", page: int = 1, limit_per_type: int = 50) -> str:
     qs = urlencode({
@@ -310,15 +326,131 @@ def auto_pick_slug(query: str = "tennis", page: int = 1, limit_per_type: int = 5
     data = http_get_json(url)
 
     events = data.get("events") or []
+    candidates = []
+
     for ev in events:
         if not isinstance(ev, dict):
             continue
-        if ev.get("enableOrderBook") is True:
-            slug = ev.get("slug")
-            if isinstance(slug, str) and slug.strip():
-                return slug.strip()
+        if ev.get("enableOrderBook") is not True:
+            continue
+        if not ev.get("slug"):
+            continue
+        if not is_match_event(ev):
+            continue
+        candidates.append(ev)
 
-    raise RuntimeError("No CLOB-enabled events found via public-search. Try a different --query or --page.")
+    if not candidates:
+        raise RuntimeError(
+            "No CLOB-enabled events found via public-search."
+        )
+
+    # 🔥 Liquidity-first ranking
+    candidates.sort(key=score_event_liquidity_first)
+
+    chosen = candidates[0]
+
+    slug = str(chosen.get("slug")).strip()
+    liquidity = get_event_liquidity(chosen)
+    dt = parse_event_datetime(chosen)
+
+    print(
+        f"[{utc_now_iso()}] Auto-picked slug={slug} "
+        f"title={chosen.get('title')} "
+        f"liquidity={liquidity} "
+        f"time={dt}",
+        flush=True
+    )
+
+    return slug
+
+
+
+
+
+def safe_float_or_zero(x):
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+
+def get_event_liquidity(ev: dict) -> float:
+    """
+    Try multiple liquidity fields (API is inconsistent).
+    """
+    return max(
+        safe_float_or_zero(ev.get("liquidity")),
+        safe_float_or_zero(ev.get("liquidityClob")),
+        safe_float_or_zero(ev.get("volume")),
+    )
+
+
+def parse_event_datetime(ev: dict):
+    from datetime import datetime, timezone
+
+    candidates = [
+        ev.get("gameStartTime"),
+        ev.get("startTime"),
+        ev.get("eventDate"),
+        ev.get("startDate"),
+    ]
+
+    for value in candidates:
+        if not isinstance(value, str):
+            continue
+
+        s = value.strip()
+        if not s:
+            continue
+
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+
+        try:
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            continue
+
+    return None
+
+
+
+
+def score_event_liquidity_first(ev: dict):
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+
+    enable_order_book = bool(ev.get("enableOrderBook"))
+    active = bool(ev.get("active"))
+    closed = bool(ev.get("closed"))
+
+    liquidity = get_event_liquidity(ev)
+    dt = parse_event_datetime(ev)
+
+    # Hard filters (penalties)
+    if not enable_order_book:
+        return (9, 0, 999999999)
+
+    if closed:
+        return (8, 0, 999999998)
+
+    if not active:
+        return (7, 0, 999999997)
+
+    # Liquidity priority (negative for descending sort)
+    liquidity_score = -liquidity
+
+    # Time tie-breaker
+    if dt:
+        delta = abs((dt - now).total_seconds())
+    else:
+        delta = 999999996
+
+    return (0, liquidity_score, delta)
 
 
 
@@ -363,6 +495,12 @@ class CsvWriter:
             self._fh.close()
         except Exception:
             pass
+        
+        
+        
+        
+        
+        
 
 
 
